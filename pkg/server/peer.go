@@ -285,6 +285,12 @@ func (peer *peer) updateRoutes(paths ...*table.Path) {
 				// store only the first insert, mutations are inplace
 				peer.sentPaths.Store(destLocalKey, identifiers)
 			}
+			// The path is being advertised, so it is no longer withheld by the
+			// add-paths send-max limit. Callers that suppress a path for that
+			// reason never record it as sent, so reaching this point means the
+			// flag, if set, is stale. Leaving it set would make the withdrawal
+			// path treat the route as never advertised and skip its withdrawal.
+			peer.unsetPathSendMaxFiltered(path)
 		}
 	}
 }

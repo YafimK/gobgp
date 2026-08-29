@@ -4656,3 +4656,149 @@ func TestRTCShouldNotAdvertiseVPNRouteWhenRTCIsNotPassImportPolicies(t *testing.
 	require.Never(t, vpnPresentAtS2AdjIn, 10*time.Second, 100*time.Millisecond,
 		"VPN route should not appear at s2 adj-in from s1 after second VPN prefix is added")
 }
+
+// A path suppressed by the add-paths send-max limit is flagged as such. When a
+// slot frees up and the path is advertised after all, the flag has to be
+// cleared: the withdrawal path treats a flagged path as one that was never
+// advertised and skips its withdrawal, which would leave a stale route on the
+// peer forever.
+func TestAddPathSendMaxFilteredFlagClearedOnAdvertisement(t *testing.T) {
+	ctx := context.Background()
+	s := NewBgpServer()
+	go s.Serve()
+
+	require.NoError(t, s.StartBgp(ctx, &api.StartBgpRequest{
+		Global: &api.Global{Asn: 65001, RouterId: "1.1.1.1", ListenPort: -1},
+	}))
+	require.NoError(t, s.policy.SetPolicyAssignment(
+		table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_IMPORT, nil, table.ROUTE_TYPE_ACCEPT))
+
+	peerAddr := netip.MustParseAddr("10.0.0.1")
+	p := newPeerandInfo(t, 65001, 65002, peerAddr.String(), s.globalRib)
+	p.policy = s.policy
+	p.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED)
+	p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND})
+	p.fsm.lock.Lock()
+	conf := p.fsm.pConf.ReadCopy()
+	for i := range conf.AfiSafis {
+		if conf.AfiSafis[i].State.Family != bgp.RF_IPv4_UC {
+			continue
+		}
+		conf.AfiSafis[i].AddPaths.Config.SendMax = 1
+		conf.AfiSafis[i].AddPaths.State.SendMax = 1
+	}
+	p.fsm.pConf.Update(&conf)
+	p.fsm.lock.Unlock()
+
+	require.NoError(t, s.mgmtOperation(func() error {
+		s.neighborMap[peerAddr] = p
+		return nil
+	}, true))
+	t.Cleanup(func() {
+		_ = s.mgmtOperation(func() error {
+			delete(s.neighborMap, peerAddr)
+			return nil
+		}, false)
+		cleanInfiniteChannel(p.fsm.outgoingCh)
+		_ = s.StopBgp(ctx, &api.StopBgpRequest{})
+	})
+
+	mk := func(srcAddr string, as uint32, comm, withdraw bool) *table.Path {
+		src := &table.PeerInfo{
+			AS: as, ID: netip.MustParseAddr(srcAddr), Address: netip.MustParseAddr(srcAddr),
+			LocalAS: 65001, LocalID: netip.MustParseAddr("1.1.1.1"),
+			LocalAddress: netip.MustParseAddr("1.1.1.1"),
+		}
+		nlri, nerr := bgp.NewIPAddrPrefix(netip.MustParsePrefix("192.0.2.0/32"))
+		require.NoError(t, nerr)
+		nh, herr := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.254"))
+		require.NoError(t, herr)
+		attrs := []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{bgp.NewAs4PathParam(2, []uint32{as})}),
+			nh,
+		}
+		if comm {
+			attrs = append(attrs, bgp.NewPathAttributeCommunities([]uint32{100<<16 | 100}))
+		}
+		return table.NewPath(bgp.RF_IPv4_UC, src, bgp.PathNLRI{NLRI: nlri}, withdraw, attrs, time.Now(), false)
+	}
+
+	collect := func() []*table.Path {
+		out := []*table.Path{}
+		for {
+			select {
+			case o := <-p.fsm.outgoingCh.Out():
+				if msg, ok := o.(*fsmOutgoingMsg); ok {
+					for _, pa := range msg.Paths {
+						if pa != nil && !pa.IsEOR() {
+							out = append(out, pa)
+						}
+					}
+				}
+			case <-time.After(400 * time.Millisecond):
+				return out
+			}
+		}
+	}
+
+	// A carries the community the export policy will later reject, B does not.
+	// With send-max 1, A is advertised and B is withheld by the limit.
+	s.propagateUpdate(nil, []*table.Path{mk("10.0.0.2", 65010, true, false)})
+	collect()
+
+	B := mk("10.0.0.3", 65011, false, false)
+	s.propagateUpdate(nil, []*table.Path{B})
+	collect()
+
+	require.True(t, p.isPathSendMaxFiltered(B), "precondition: B must be suppressed by send-max")
+
+	// Add a policy rejecting A's community, then soft reset out.
+	commSet, err := table.NewCommunitySet(oc.CommunitySet{
+		CommunitySetName: "rc", CommunityList: []string{"100:100"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.policy.AddDefinedSet(commSet, false))
+	pol, err := table.NewPolicy(oc.PolicyDefinition{
+		Name: "rp",
+		Statements: []oc.Statement{{
+			Name: "st",
+			Conditions: oc.Conditions{BgpConditions: oc.BgpConditions{
+				MatchCommunitySet: oc.MatchCommunitySet{CommunitySet: "rc"},
+			}},
+			Actions: oc.Actions{RouteDisposition: oc.ROUTE_DISPOSITION_REJECT_ROUTE},
+		}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, s.policy.AddPolicy(pol, false))
+	require.NoError(t, s.policy.AddPolicyAssignment(
+		table.GLOBAL_RIB_NAME, table.POLICY_DIRECTION_EXPORT,
+		[]*oc.PolicyDefinition{{Name: "rp"}}, table.ROUTE_TYPE_ACCEPT))
+
+	require.NoError(t, s.softResetOut(peerAddr.String(), bgp.RF_IPv4_UC, false))
+	afterReset := collect()
+
+	advertisedB := false
+	for _, pa := range afterReset {
+		if !pa.IsWithdraw {
+			advertisedB = true
+		}
+	}
+
+	// Upstream now withdraws B. A correctly-tracked peer must receive a withdrawal.
+	s.propagateUpdate(nil, []*table.Path{mk("10.0.0.3", 65011, false, true)})
+	afterWithdraw := collect()
+
+	withdrawals := 0
+	for _, pa := range afterWithdraw {
+		if pa.IsWithdraw {
+			withdrawals++
+		}
+	}
+
+	require.True(t, advertisedB, "soft reset should re-advertise B once A's slot is freed")
+	require.False(t, p.isPathSendMaxFiltered(B),
+		"B is advertised, so its send-max-filtered flag must be cleared")
+	require.Equal(t, 1, withdrawals,
+		"withdrawing an advertised path must reach the peer")
+}
