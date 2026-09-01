@@ -759,6 +759,172 @@ func TestSoftResetOutAddPathWithdrawsOnlyAdvertisedFilteredRoutes(t *testing.T) 
 	requireNoOutgoing()
 }
 
+// TestAddPathSendMaxWithdrawalAndBackfill exercises the add-paths send-max
+// backfill behavior derived from peer.sentPaths: with SendMax=1, a losing
+// path on the same prefix as the currently-sent best path must not be
+// advertised, but must be backfilled once the best path is withdrawn.
+func TestAddPathSendMaxWithdrawalAndBackfill(t *testing.T) {
+	ctx := context.Background()
+	s := NewBgpServer()
+	go s.Serve()
+
+	err := s.StartBgp(ctx, &api.StartBgpRequest{
+		Global: &api.Global{
+			Asn:        65001,
+			RouterId:   "1.1.1.1",
+			ListenPort: -1,
+		},
+	})
+	require.NoError(t, err)
+
+	peerAddr := netip.MustParseAddr("10.0.0.1")
+	p := newPeerandInfo(t, 65001, 65002, peerAddr.String(), s.globalRib)
+	p.policy = s.policy
+	p.fsm.state.Store(bgp.BGP_FSM_ESTABLISHED)
+	p.fsm.familyMap.Store(map[bgp.Family]bgp.BGPAddPathMode{
+		bgp.RF_IPv4_UC: bgp.BGP_ADD_PATH_SEND,
+	})
+	p.fsm.lock.Lock()
+	conf := p.fsm.pConf.ReadCopy()
+	foundFamily := false
+	for i := range conf.AfiSafis {
+		if conf.AfiSafis[i].State.Family != bgp.RF_IPv4_UC {
+			continue
+		}
+		conf.AfiSafis[i].AddPaths.Config.SendMax = 1
+		foundFamily = true
+	}
+	p.fsm.pConf.Update(&conf)
+	p.fsm.lock.Unlock()
+	require.True(t, foundFamily)
+
+	err = s.mgmtOperation(func() error {
+		s.neighborMap[peerAddr] = p
+		return nil
+	}, true)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		err := s.mgmtOperation(func() error {
+			delete(s.neighborMap, peerAddr)
+			return nil
+		}, false)
+		require.NoError(t, err)
+		cleanInfiniteChannel(p.fsm.outgoingCh)
+		require.NoError(t, s.StopBgp(ctx, &api.StopBgpRequest{}))
+	})
+
+	const prefix = "192.0.2.0/32"
+
+	// makeCompetingPath builds a path to the shared prefix from a distinct
+	// source, with asPathLen controlling best-path preference (shorter wins).
+	makeCompetingPath := func(source string, asPathLen int) *table.Path {
+		t.Helper()
+		nlri, err := bgp.NewIPAddrPrefix(netip.MustParsePrefix(prefix))
+		require.NoError(t, err)
+		nextHop, err := bgp.NewPathAttributeNextHop(netip.MustParseAddr("192.0.2.254"))
+		require.NoError(t, err)
+		sourceAddr := netip.MustParseAddr(source)
+		asns := make([]uint32, asPathLen)
+		for i := range asns {
+			asns[i] = 65010 + uint32(i)
+		}
+		return table.NewPath(bgp.RF_IPv4_UC, &table.PeerInfo{
+			AS:           65010,
+			ID:           sourceAddr,
+			Address:      sourceAddr,
+			LocalAS:      65001,
+			LocalID:      netip.MustParseAddr("1.1.1.1"),
+			LocalAddress: netip.MustParseAddr("1.1.1.1"),
+		}, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{
+			bgp.NewPathAttributeOrigin(0),
+			bgp.NewPathAttributeAsPath([]bgp.AsPathParamInterface{
+				bgp.NewAs4PathParam(2, asns),
+			}),
+			nextHop,
+		}, time.Now(), false)
+	}
+	requireOutgoing := func() []*table.Path {
+		t.Helper()
+		select {
+		case o := <-p.fsm.outgoingCh.Out():
+			msg, ok := o.(*fsmOutgoingMsg)
+			require.True(t, ok)
+			paths := make([]*table.Path, 0, len(msg.Paths))
+			for _, path := range msg.Paths {
+				if path != nil && !path.IsEOR() {
+					paths = append(paths, path)
+				}
+			}
+			return paths
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for outbound add-path paths")
+			return nil
+		}
+	}
+	requireNoOutgoing := func() {
+		t.Helper()
+		select {
+		case o := <-p.fsm.outgoingCh.Out():
+			t.Fatalf("unexpected outbound paths: %#v", o)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	require.NoError(t, s.SetPolicyAssignment(ctx, &api.SetPolicyAssignmentRequest{
+		Assignment: &api.PolicyAssignment{
+			Name:          table.GLOBAL_RIB_NAME,
+			Direction:     api.PolicyDirection_POLICY_DIRECTION_EXPORT,
+			DefaultAction: api.RouteAction_ROUTE_ACTION_ACCEPT,
+		},
+	}))
+
+	pathA := makeCompetingPath("10.0.0.2", 1) // shorter AS-path: best
+	pathB := makeCompetingPath("10.0.0.3", 2) // longer AS-path: withheld by send-max
+
+	// A is advertised as the best path.
+	s.propagateUpdate(nil, []*table.Path{pathA})
+	sent := requireOutgoing()
+	require.Len(t, sent, 1)
+	require.False(t, sent[0].IsWithdraw)
+	require.Equal(t, pathA.LocalID(), sent[0].LocalID())
+	require.True(t, p.hasPathAlreadyBeenSent(sent[0]))
+
+	// B arrives, loses best-path selection to A, and is withheld by send-max=1:
+	// no update should be emitted for B, and it must not be recorded as sent.
+	s.propagateUpdate(nil, []*table.Path{pathB})
+	requireNoOutgoing()
+	require.False(t, p.hasPathAlreadyBeenSent(pathB))
+
+	// A is re-advertised (e.g. an attribute update): still the only sent path.
+	s.propagateUpdate(nil, []*table.Path{pathA})
+	sent = requireOutgoing()
+	require.Len(t, sent, 1)
+	require.Equal(t, pathA.LocalID(), sent[0].LocalID())
+	require.False(t, p.hasPathAlreadyBeenSent(pathB))
+
+	// A is withdrawn: its withdrawal must be emitted, and B must be backfilled
+	// into the freed send-max slot.
+	pathAWithdraw := pathA.Clone(true)
+	s.propagateUpdate(nil, []*table.Path{pathAWithdraw})
+	sent = requireOutgoing()
+	require.Len(t, sent, 2)
+
+	var gotWithdraw, gotBackfill bool
+	for _, path := range sent {
+		switch {
+		case path.IsWithdraw && path.LocalID() == pathA.LocalID():
+			gotWithdraw = true
+		case !path.IsWithdraw && path.LocalID() == pathB.LocalID():
+			gotBackfill = true
+		}
+	}
+	require.True(t, gotWithdraw, "A's withdrawal must be emitted")
+	require.True(t, gotBackfill, "B must be backfilled once A's slot is freed")
+
+	require.False(t, p.hasPathAlreadyBeenSent(pathA))
+	require.True(t, p.hasPathAlreadyBeenSent(pathB))
+	require.EqualValues(t, 1, p.getRoutesCount(bgp.RF_IPv4_UC, prefix))
+}
+
 func TestRTCMembershipSerializesTriggeredVPNUpdates(t *testing.T) {
 	s := NewBgpServer()
 	go s.Serve()

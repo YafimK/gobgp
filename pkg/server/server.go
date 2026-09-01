@@ -1568,6 +1568,12 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							}
 						}
 					} else {
+						// This is the only place a path that passes export policy is withheld
+						// without being recorded in sentPaths. The withdraw skip and the
+						// backfill loop above, and the send-max reporting in
+						// adjRibOutPathsToUpdate, all infer "absent from sentPaths" means
+						// "withheld by send-max". A second reason to withhold such a path
+						// must not be added here without revisiting all three.
 						bestList = []*table.Path{}
 						targetPeer.fsm.logger.Warn("exceeding max routes for prefix", slog.String("Prefix", newPath.GetPrefix()))
 					}
@@ -3083,18 +3089,16 @@ func (s *BgpServer) adjRibOutPathsToUpdate(peer *peer, pathList []*table.Path, f
 		// is the only reason this code path declines to advertise a path it
 		// has otherwise accepted. Paths rejected by export policy are already
 		// marked above and must not also be reported as send-max filtered.
-		// The PolicyFiltered guard is only load-bearing for the
-		// policyEvaluatedAdjRibOutPaths caller: the other caller,
-		// adjRibOutForListPath's enableFiltered=false branch, gets its
-		// pathList from getBestFromLocalCallback, which already excludes
-		// export-policy-rejected paths before this function ever sees them.
+		// An add-path-eligible path absent from the sent set is withheld by
+		// send-max. Skip export-policy-rejected paths: they reach this
+		// function with PolicyFiltered already set.
 		if peer.isAddPathSendEnabled(path.GetFamily()) && filtered[pathLocalKey]&table.PolicyFiltered == 0 {
 			bucket := s.shared.propagateBucket(path)
 			bucket.Lock()
 			sent := peer.hasPathAlreadyBeenSent(path)
 			bucket.Unlock()
 			if !sent {
-				filtered[pathLocalKey] = filtered[pathLocalKey] | table.SendMaxFiltered
+				filtered[pathLocalKey] |= table.SendMaxFiltered
 			}
 		}
 		toUpdate = append(toUpdate, path)
