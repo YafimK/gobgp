@@ -1505,7 +1505,7 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 								// if the path is filtered, there is no need to send the withdrawal
 								p := s.filterpath(targetPeer, p, nil)
 								// the path was never advertized to the peer
-								if p == nil || targetPeer.unsetPathSendMaxFiltered(p) {
+								if p == nil || !targetPeer.hasPathAlreadyBeenSent(p) {
 									continue
 								}
 								toActuallyDelete = append(toActuallyDelete, p)
@@ -1527,14 +1527,15 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							knownPathList := destination.GetKnownPathList(targetPeer.TableID(), targetPeer.AS())
 							toAdd := make([]*table.Path, 0, len(knownPathList))
 							for _, p := range knownPathList {
-								// If the path is filtered by policies, there is no need to send the path
-								// Otherwise, we send only paths that were previously filtered because of the max path limit
+								// If the path is filtered by policies, there is no need to send the path.
+								// Otherwise, we send only paths that are not already advertised: a path
+								// that passes export policy but was never sent can only have been held
+								// back by the add-paths send-max limit, whose slots the withdrawals
+								// above have just freed.
 								p := s.filterpath(targetPeer, p, nil)
-								if p == nil || !targetPeer.isPathSendMaxFiltered(p) {
+								if p == nil || targetPeer.hasPathAlreadyBeenSent(p) {
 									continue
 								}
-								// We unset the flag as the path is not filtered anymore
-								targetPeer.unsetPathSendMaxFiltered(p)
 								toAdd = append(toAdd, p)
 								if len(toAdd) == len(toActuallyDelete) {
 									break
@@ -1568,7 +1569,6 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 						}
 					} else {
 						bestList = []*table.Path{}
-						targetPeer.setPathSendMaxFiltered(newPath)
 						targetPeer.fsm.logger.Warn("exceeding max routes for prefix", slog.String("Prefix", newPath.GetPrefix()))
 					}
 				}
@@ -3047,7 +3047,7 @@ func (s *BgpServer) adjRibOutForListPath(peer *peer, family bgp.Family, enableFi
 		toUpdate = s.policyEvaluatedAdjRibOutPaths(peer, family, filtered)
 	} else {
 		s.getBestFromLocalCallback(peer, peer.configuredRFlist(), true, false, func(paths []*table.Path, _ []*table.Path) {
-			toUpdate = adjRibOutPathsToUpdate(peer, paths, filtered)
+			toUpdate = s.adjRibOutPathsToUpdate(peer, paths, filtered)
 		})
 	}
 	adjRib.Update(toUpdate)
@@ -3068,18 +3068,34 @@ func (s *BgpServer) policyEvaluatedAdjRibOutPaths(peer *peer, family bgp.Family,
 		}
 		pathList = append(pathList, path)
 	}
-	return adjRibOutPathsToUpdate(peer, pathList, filtered)
+	return s.adjRibOutPathsToUpdate(peer, pathList, filtered)
 }
 
-func adjRibOutPathsToUpdate(peer *peer, pathList []*table.Path, filtered map[table.PathLocalKey]table.FilteredType) []*table.Path {
+func (s *BgpServer) adjRibOutPathsToUpdate(peer *peer, pathList []*table.Path, filtered map[table.PathLocalKey]table.FilteredType) []*table.Path {
 	toUpdate := make([]*table.Path, 0, len(pathList))
 	for _, path := range pathList {
 		if path.IsEOR() {
 			continue
 		}
 		pathLocalKey := path.GetLocalKey()
-		if peer.isPathSendMaxFiltered(path) {
-			filtered[pathLocalKey] = filtered[pathLocalKey] | table.SendMaxFiltered
+		// A path that add-paths would advertise but that is absent from the
+		// peer's sent set is being withheld by the send-max limit: that limit
+		// is the only reason this code path declines to advertise a path it
+		// has otherwise accepted. Paths rejected by export policy are already
+		// marked above and must not also be reported as send-max filtered.
+		// The PolicyFiltered guard is only load-bearing for the
+		// policyEvaluatedAdjRibOutPaths caller: the other caller,
+		// adjRibOutForListPath's enableFiltered=false branch, gets its
+		// pathList from getBestFromLocalCallback, which already excludes
+		// export-policy-rejected paths before this function ever sees them.
+		if peer.isAddPathSendEnabled(path.GetFamily()) && filtered[pathLocalKey]&table.PolicyFiltered == 0 {
+			bucket := s.shared.propagateBucket(path)
+			bucket.Lock()
+			sent := peer.hasPathAlreadyBeenSent(path)
+			bucket.Unlock()
+			if !sent {
+				filtered[pathLocalKey] = filtered[pathLocalKey] | table.SendMaxFiltered
+			}
 		}
 		toUpdate = append(toUpdate, path)
 	}

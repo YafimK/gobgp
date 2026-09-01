@@ -114,11 +114,9 @@ type peer struct {
 	// All methods that read or mutate a pathIDSet value (updateRoutes,
 	// getRoutesCount, hasPathAlreadyBeenSent) MUST be called under the
 	// bucket lock for that prefix (sharedData.propagateBucket).
-	sentPaths sync.Map
-	// map[table.PathLocalKey]struct{}
-	sendMaxPathFiltered sync.Map
-	llgrEndChs          []chan struct{} // protected by fsm.lock
-	longLivedRunning    atomic.Bool
+	sentPaths        sync.Map
+	llgrEndChs       []chan struct{} // protected by fsm.lock
+	longLivedRunning atomic.Bool
 	// Route Target Membership handler after import policy (for constrained VPN distribution).
 	rtmHandler *table.RouteTargetMembershipHandler
 	// Route refresh in progress, during an established session or route refresh, this need to be atomic to avoid out of order updates
@@ -289,32 +287,6 @@ func (peer *peer) updateRoutes(paths ...*table.Path) {
 	}
 }
 
-func (peer *peer) isPathSendMaxFiltered(path *table.Path) bool {
-	if path == nil {
-		return false
-	}
-	_, found := peer.sendMaxPathFiltered.Load(path.GetLocalKey())
-	return found
-}
-
-func (peer *peer) setPathSendMaxFiltered(path *table.Path) {
-	if path == nil {
-		return
-	}
-	peer.sendMaxPathFiltered.Store(path.GetLocalKey(), struct{}{})
-}
-
-func (peer *peer) unsetPathSendMaxFiltered(path *table.Path) bool {
-	if path == nil {
-		return false
-	}
-	if _, ok := peer.sendMaxPathFiltered.Load(path.GetLocalKey()); !ok {
-		return false
-	}
-	peer.sendMaxPathFiltered.Delete(path.GetLocalKey())
-	return true
-}
-
 func (peer *peer) hasPathAlreadyBeenSent(path *table.Path) bool {
 	if path == nil {
 		return false
@@ -330,7 +302,6 @@ func (peer *peer) hasPathAlreadyBeenSent(path *table.Path) bool {
 
 func (peer *peer) resetAdvertisedRoutes() {
 	peer.sentPaths.Clear()
-	peer.sendMaxPathFiltered.Clear()
 }
 
 func (peer *peer) isDynamicNeighbor() bool {
