@@ -1527,13 +1527,14 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							knownPathList := destination.GetKnownPathList(targetPeer.TableID(), targetPeer.AS())
 							toAdd := make([]*table.Path, 0, len(knownPathList))
 							for _, p := range knownPathList {
-								// If the path is filtered by policies, there is no need to send the path.
-								// Otherwise, we send only paths that are not already advertised: a path
-								// that passes export policy but was never sent can only have been held
-								// back by the add-paths send-max limit, whose slots the withdrawals
-								// above have just freed.
+								// Backfill the slots the withdrawals above just freed. A path that
+								// passes export policy and is not already advertised was held back
+								// by the send-max limit, so it is a candidate. filterpath can also
+								// turn an LLGR-stale path into a withdrawal for a peer that has not
+								// negotiated LLGR; that is not a candidate, and counting it would
+								// spend a freed slot without advertising anything.
 								p := s.filterpath(targetPeer, p, nil)
-								if p == nil || targetPeer.hasPathAlreadyBeenSent(p) {
+								if p == nil || p.IsWithdraw || targetPeer.hasPathAlreadyBeenSent(p) {
 									continue
 								}
 								toAdd = append(toAdd, p)
@@ -1568,12 +1569,12 @@ func (s *BgpServer) propagateUpdateToNeighbors(rib *table.TableManager, source *
 							}
 						}
 					} else {
-						// This is the only place a path that passes export policy is withheld
-						// without being recorded in sentPaths. The withdraw skip and the
-						// backfill loop above, and the send-max reporting in
-						// adjRibOutPathsToUpdate, all infer "absent from sentPaths" means
-						// "withheld by send-max". A second reason to withhold such a path
-						// must not be added here without revisiting all three.
+						// Paths withheld here are not recorded in sentPaths. The backfill loop
+						// above and the send-max reporting in adjRibOutPathsToUpdate both read
+						// "passes export policy but absent from sentPaths" as "withheld by
+						// send-max", so a further reason to withhold such a path needs both
+						// of them revisited. postFilterpath's LLGR-stale clause is one
+						// already, which is why the backfill loop skips withdrawals.
 						bestList = []*table.Path{}
 						targetPeer.fsm.logger.Warn("exceeding max routes for prefix", slog.String("Prefix", newPath.GetPrefix()))
 					}
@@ -3084,15 +3085,15 @@ func (s *BgpServer) adjRibOutPathsToUpdate(peer *peer, pathList []*table.Path, f
 			continue
 		}
 		pathLocalKey := path.GetLocalKey()
-		// A path that add-paths would advertise but that is absent from the
-		// peer's sent set is being withheld by the send-max limit: that limit
-		// is the only reason this code path declines to advertise a path it
-		// has otherwise accepted. Paths rejected by export policy are already
-		// marked above and must not also be reported as send-max filtered.
 		// An add-path-eligible path absent from the sent set is withheld by
 		// send-max. Skip export-policy-rejected paths: they reach this
-		// function with PolicyFiltered already set.
-		if peer.isAddPathSendEnabled(path.GetFamily()) && filtered[pathLocalKey]&table.PolicyFiltered == 0 {
+		// function with PolicyFiltered already set. The sent set is only
+		// meaningful while the session is up: it is cleared when the peer
+		// goes down, whereas the negotiated add-path modes are not, so
+		// without this check every path would be reported as withheld.
+		if peer.State() == bgp.BGP_FSM_ESTABLISHED &&
+			peer.isAddPathSendEnabled(path.GetFamily()) &&
+			filtered[pathLocalKey]&table.PolicyFiltered == 0 {
 			bucket := s.shared.propagateBucket(path)
 			bucket.Lock()
 			sent := peer.hasPathAlreadyBeenSent(path)
